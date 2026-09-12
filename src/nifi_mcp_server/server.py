@@ -714,7 +714,25 @@ def create_server(nifi: NiFiClient, readonly: bool) -> FastMCP:
 			"""
 			data = nifi.terminate_processor(processor_id, version)
 			return _redact_sensitive(data)
-	
+
+		@app.tool()
+		async def replay_flowfile_from_provenance(event_id: str) -> Dict[str, Any]:
+			"""Re-queue a new flowfile from a provenance event's content. **WRITE OPERATION** - Requires NIFI_READONLY=false.
+
+			Only works if the event's source connection still exists - call get_provenance_event_details(event_id)
+			first and check the "replayAvailable" field (its "replayExplanation" field says why not, if false).
+
+			Use case: "Replay that failed flowfile through the flow again"
+			"""
+			data = nifi.replay_flowfile_from_provenance(event_id)
+			return _redact_sensitive(data)
+
+		@app.tool()
+		async def reset_counter(counter_id: str) -> Dict[str, Any]:
+			"""Reset a single NiFi counter's value to 0. **WRITE OPERATION** - Requires NIFI_READONLY=false."""
+			data = nifi.reset_counter(counter_id)
+			return _redact_sensitive(data)
+
 	# Read-only health monitoring tool (available even in readonly mode)
 	@app.tool()
 	async def get_flow_health_status(pg_id: str) -> Dict[str, Any]:
@@ -734,6 +752,151 @@ def create_server(nifi: NiFiClient, readonly: bool) -> FastMCP:
 		  - "Check for errors in my data ingestion group"
 		"""
 		data = nifi.get_flow_health_status(pg_id)
+		return _redact_sensitive(data)
+
+	# ===== FlowFile Queue & Provenance (Debug Tools, read-only) =====
+
+	@app.tool()
+	async def list_queue_flowfiles(connection_id: str, max_results: int = 100) -> Dict[str, Any]:
+		"""List flowfiles currently sitting in a connection's queue (read-only).
+
+		Returns up to max_results flowfile summaries (uuid, filename, size, position, how long
+		queued). NiFi itself caps a single listing at 100 flowfiles.
+
+		Use cases:
+		  - "What's stuck in this queue?"
+		  - "Show me the flowfiles waiting in connection abc-123"
+		"""
+		data = nifi.list_queue_flowfiles(connection_id, max_results=max_results)
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_flowfile_details(connection_id: str, flowfile_uuid: str) -> Dict[str, Any]:
+		"""Get metadata and attributes for a single queued flowfile (read-only).
+
+		Get the flowfile_uuid from list_queue_flowfiles() first.
+		"""
+		data = nifi.get_flowfile_details(connection_id, flowfile_uuid)
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_flowfile_content(connection_id: str, flowfile_uuid: str, max_bytes: int = 8192) -> Dict[str, Any]:
+		"""Download the content of a single queued flowfile (read-only).
+
+		Content is truncated to max_bytes and returned as UTF-8 text when possible, otherwise
+		base64-encoded (check the "encoding" field of the result). Get the flowfile_uuid from
+		list_queue_flowfiles() first.
+		"""
+		return nifi.get_flowfile_content(connection_id, flowfile_uuid, max_bytes=max_bytes)
+
+	@app.tool()
+	async def search_provenance(
+		component_id: Optional[str] = None,
+		flowfile_uuid: Optional[str] = None,
+		search_terms: Optional[Dict[str, str]] = None,
+		start_date: Optional[str] = None,
+		end_date: Optional[str] = None,
+		max_results: int = 100,
+	) -> Dict[str, Any]:
+		"""Search provenance events (read-only) - answers "where did this flowfile come from",
+		"why did it fail", "what happened to it".
+
+		Args:
+		  component_id: filter to events produced by a specific processor (its ID)
+		  flowfile_uuid: filter to a specific flowfile's full lineage (its UUID)
+		  search_terms: raw field->value map for other NiFi provenance search fields
+		    (e.g. {"Filename": "orders.csv", "EventType": "DROP"})
+		  start_date/end_date: NiFi provenance date format, e.g. "09/11/2026 00:00:00 UTC"
+		  max_results: maximum number of events to return (default 100)
+
+		Returns a list of provenance events (each with an "id" usable with
+		get_provenance_event_details()). At least one filter is strongly recommended -
+		an unfiltered search can be slow on a busy NiFi instance.
+
+		Use cases:
+		  - "Why did flowfile abc-123 fail?"
+		  - "What happened to files processed by processor xyz-789 in the last hour?"
+		"""
+		data = nifi.search_provenance(
+			search_terms=search_terms,
+			component_id=component_id,
+			flowfile_uuid=flowfile_uuid,
+			start_date=start_date,
+			end_date=end_date,
+			max_results=max_results,
+		)
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_provenance_event_details(event_id: str) -> Dict[str, Any]:
+		"""Get full details for a single provenance event (read-only): attributes, the
+		component that produced it, and whether its flowfile content can still be downloaded
+		(inputContentAvailable/outputContentAvailable) or replayed (replayAvailable).
+
+		Get the event_id from search_provenance() first.
+		"""
+		data = nifi.get_provenance_event(event_id)
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_provenance_event_content(event_id: str, direction: str = "output", max_bytes: int = 8192) -> Dict[str, Any]:
+		"""Download the flowfile content snapshot associated with a provenance event (read-only).
+
+		Args:
+		  event_id: from search_provenance()
+		  direction: "input" or "output" - check inputContentAvailable/outputContentAvailable
+		    on get_provenance_event_details(event_id) first to see which are available
+		  max_bytes: truncate content to this size (default 8192)
+		"""
+		return nifi.get_provenance_event_content(event_id, direction=direction, max_bytes=max_bytes)
+
+	# ===== Operational Diagnostics (read-only) =====
+
+	@app.tool()
+	async def get_system_diagnostics() -> Dict[str, Any]:
+		"""Get JVM/host diagnostics for the NiFi instance (read-only): heap/CPU usage, garbage
+		collection, disk usage for the flowfile/content/provenance repositories, uptime.
+
+		Use cases:
+		  - "Is NiFi running low on disk space?"
+		  - "How's the heap usage looking?"
+		"""
+		data = nifi.get_system_diagnostics()
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_processor_diagnostics(processor_id: str) -> Dict[str, Any]:
+		"""Get deep diagnostics for a single processor (read-only): thread dumps for any active
+		threads, referenced controller services, and incoming/outgoing connection status.
+
+		Use this to investigate a processor that appears stuck or unresponsive, before
+		resorting to terminate_processor().
+		"""
+		data = nifi.get_processor_diagnostics(processor_id)
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def get_cluster_summary() -> Dict[str, Any]:
+		"""Get cluster status (read-only): whether this NiFi is clustered, and connected/total node counts."""
+		data = nifi.get_cluster_summary()
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def list_cluster_nodes() -> Dict[str, Any]:
+		"""List cluster nodes and their status (read-only): heartbeat, connection state, load.
+
+		Returns {"clustered": false} for a standalone (non-clustered) NiFi instance rather
+		than an error.
+		"""
+		data = nifi.list_cluster_nodes()
+		return _redact_sensitive(data)
+
+	@app.tool()
+	async def list_counters() -> Dict[str, Any]:
+		"""List all NiFi counters (read-only). Counters are lightweight named tallies some
+		processors increment (e.g. records read/written) - useful for monitoring throughput.
+		"""
+		data = nifi.list_counters()
 		return _redact_sensitive(data)
 
 	return app

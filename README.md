@@ -12,7 +12,7 @@ Model Context Protocol server providing selectable read and write access to Apac
 - **Knox authentication** - Supports Bearer tokens, cookies, and passcode tokens for CDP deployments
 - **Read-only by default** - Safe exploration of NiFi flows and configuration
 - **Intelligent flow building** - Pattern recognition and requirements gathering for complex flows
-- **24 read-only MCP tools** for exploring NiFi:
+- **35 read-only MCP tools** for exploring NiFi:
   - `get_nifi_version()` - Version and build information
   - `get_root_process_group()` - Root process group details
   - `list_processors(process_group_id)` - List processors in a process group
@@ -37,7 +37,18 @@ Model Context Protocol server providing selectable read and write access to Apac
   - `get_setup_instructions()` - Interactive setup guidance for NiFi MCP Server
   - `get_best_practices_guide()` - Best practices for building NiFi flows
   - `get_recommended_workflow(flow_type)` - Step-by-step guidance for common flow patterns
-- **42 write operations** (when `NIFI_READONLY=false`):
+  - `list_queue_flowfiles(connection_id, max_results?)` - List flowfiles waiting in a connection's queue
+  - `get_flowfile_details(connection_id, flowfile_uuid)` - Attributes/metadata for a single queued flowfile
+  - `get_flowfile_content(connection_id, flowfile_uuid, max_bytes?)` - Download a queued flowfile's content
+  - `search_provenance(component_id?, flowfile_uuid?, search_terms?, ...)` - Search provenance events (why a flowfile failed, where it came from)
+  - `get_provenance_event_details(event_id)` - Full details for a single provenance event
+  - `get_provenance_event_content(event_id, direction, max_bytes?)` - Download a flowfile content snapshot from a provenance event
+  - `get_system_diagnostics()` - JVM/host diagnostics: heap, CPU, disk usage, GC, uptime
+  - `get_processor_diagnostics(processor_id)` - Deep diagnostics for a processor (thread dumps, connections) - investigate stuck processors
+  - `get_cluster_summary()` - Whether this NiFi is clustered, and node counts
+  - `list_cluster_nodes()` - Cluster node status (returns `{"clustered": false}` for standalone NiFi)
+  - `list_counters()` - List NiFi counters (throughput tallies some processors maintain)
+- **44 write operations** (when `NIFI_READONLY=false`):
   - `start_processor(processor_id, version)` - Start a processor
   - `stop_processor(processor_id, version)` - Stop a processor
   - `create_processor(...)` - Create a new processor
@@ -74,6 +85,8 @@ Model Context Protocol server providing selectable read and write access to Apac
   - `enable_all_controller_services_in_group(pg_id)` - Bulk enable all services at once
   - `terminate_processor(processor_id, version)` - Force-terminate stuck processor (last resort)
   - `start_new_flow(flow_name, flow_description)` - Smart flow builder that automatically creates process groups and enforces best practices
+  - `replay_flowfile_from_provenance(event_id)` - Re-queue a new flowfile from a provenance event's content
+  - `reset_counter(counter_id)` - Reset a single NiFi counter's value to 0
 
 ## Quick Start
 
