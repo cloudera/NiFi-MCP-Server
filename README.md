@@ -1,6 +1,6 @@
-# NiFi MCP Server (via Knox)
+# NiFi MCP Server
 
-Model Context Protocol server providing selectable read and write access to Apache NiFi via Apache Knox.
+Model Context Protocol server providing selectable read and write access to Apache NiFi. Works with NiFi behind Apache Knox (CDP) **and** with a standalone/local NiFi instance with no Knox in front of it.
 
 **Works with both NiFi 1.x and 2.x** - automatic version detection and adaptation.
 
@@ -10,6 +10,7 @@ Model Context Protocol server providing selectable read and write access to Apac
 
 - **Automatic version detection** - Detects NiFi 1.x vs 2.x and adapts behavior
 - **Knox authentication** - Supports Bearer tokens, cookies, and passcode tokens for CDP deployments
+- **Standalone NiFi authentication** - Direct username/password login or mTLS client certificates for local/on-prem NiFi with no Knox in front
 - **Read-only by default** - Safe exploration of NiFi flows and configuration
 - **Intelligent flow building** - Pattern recognition and requirements gathering for complex flows
 - **24 read-only MCP tools** for exploring NiFi:
@@ -86,6 +87,18 @@ https://<your-nifi-host>/nifi-2-dh/cdp-proxy/nifi-app/nifi-api
 
 Get your Knox JWT token from the CDP UI and use it with the configurations below.
 
+### For standalone / local NiFi deployments (no Knox)
+
+Your NiFi API base URL will typically be:
+```
+https://<nifi-host>:8443/nifi-api
+```
+
+Point `NIFI_API_BASE` directly at your NiFi instance and skip Knox entirely. Choose one of:
+- **Username/password** - set `NIFI_USERNAME` and `NIFI_PASSWORD` (works for NiFi's single-user provider or an LDAP/other login identity provider); the server logs in against NiFi's own `POST /access/token` endpoint.
+- **mTLS client certificate** - set `NIFI_CLIENT_CERT` and `NIFI_CLIENT_KEY`; NiFi identifies you from the certificate, no login call needed.
+- **Anonymous** - leave all auth variables unset if your NiFi instance has anonymous access enabled (e.g. a quick local/dev instance).
+
 ## Setup
 
 ### Option 1: Claude Desktop (Local)
@@ -122,6 +135,53 @@ Get your Knox JWT token from the CDP UI and use it with the configurations below
 
 3. **Restart Claude Desktop** and start asking questions about your NiFi flows!
 
+**Example: standalone/local NiFi (no Knox), username/password login:**
+```json
+{
+  "mcpServers": {
+    "nifi-mcp-server": {
+      "command": "/FULL/PATH/TO/NiFi-MCP-Server/.venv/bin/python",
+      "args": [
+        "-m",
+        "nifi_mcp_server.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "NIFI_API_BASE": "https://localhost:8443/nifi-api",
+        "NIFI_USERNAME": "admin",
+        "NIFI_PASSWORD": "<your_nifi_password>",
+        "KNOX_VERIFY_SSL": "false",
+        "NIFI_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+**Example: standalone/local NiFi (no Knox), mTLS client certificate:**
+```json
+{
+  "mcpServers": {
+    "nifi-mcp-server": {
+      "command": "/FULL/PATH/TO/NiFi-MCP-Server/.venv/bin/python",
+      "args": [
+        "-m",
+        "nifi_mcp_server.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "NIFI_API_BASE": "https://localhost:8443/nifi-api",
+        "NIFI_CLIENT_CERT": "/FULL/PATH/TO/client-cert.pem",
+        "NIFI_CLIENT_KEY": "/FULL/PATH/TO/client-key.pem",
+        "NIFI_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+> `KNOX_VERIFY_SSL=false` above is only needed for a local NiFi using a self-signed certificate; use `KNOX_CA_BUNDLE` to point at a CA bundle instead when possible.
+
 ### Option 2: Direct Installation (Cloudera Agent Studio)
 
 For use with Cloudera Agent Studio, use the `uvx` command:
@@ -153,11 +213,31 @@ All configuration is done via environment variables:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `NIFI_API_BASE` | Yes* | Full NiFi API URL (e.g., `https://host/nifi-2-dh/cdp-proxy/nifi-app/nifi-api`) |
-| `KNOX_TOKEN` | Yes* | Knox JWT token for authentication |
+| `NIFI_API_BASE` | Yes* | Full NiFi API URL (e.g., `https://host/nifi-2-dh/cdp-proxy/nifi-app/nifi-api`, or `https://host:8443/nifi-api` for standalone NiFi) |
 | `KNOX_GATEWAY_URL` | No | Knox gateway URL (alternative to `NIFI_API_BASE`) |
-| `KNOX_COOKIE` | No | Alternative: provide full cookie string instead of token |
-| `KNOX_PASSCODE_TOKEN` | No | Alternative: Knox passcode token (auto-exchanged for JWT) |
+
+**Knox / CDP authentication** (any one of these; recommended when NiFi sits behind Knox):
+
+| Variable | Description |
+|----------|-------------|
+| `KNOX_TOKEN` | Knox JWT token for authentication |
+| `KNOX_COOKIE` | Alternative: provide full cookie string instead of token |
+| `KNOX_USER` / `KNOX_PASSWORD` | Alternative: Knox basic-auth credentials, exchanged for a JWT |
+| `KNOX_PASSCODE_TOKEN` | Alternative: Knox passcode token (auto-exchanged for JWT) |
+
+**Standalone / local NiFi authentication** (no Knox in front; any one of these):
+
+| Variable | Description |
+|----------|-------------|
+| `NIFI_USERNAME` / `NIFI_PASSWORD` | Logs in directly against NiFi's own `/access/token` endpoint (single-user or LDAP/other login identity provider) |
+| `NIFI_CLIENT_CERT` / `NIFI_CLIENT_KEY` | Paths to a client certificate/key for mTLS auth directly against NiFi |
+
+If none of the above are set, the server connects anonymously - fine for a local/dev NiFi with anonymous access enabled, otherwise NiFi will reject the requests.
+
+**Other options:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
 | `NIFI_READONLY` | No | Read-only mode (default: `true`) |
 | `KNOX_VERIFY_SSL` | No | Verify SSL certificates (default: `true`) |
 | `KNOX_CA_BUNDLE` | No | Path to CA certificate bundle |
