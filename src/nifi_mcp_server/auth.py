@@ -17,6 +17,11 @@ class KnoxAuthFactory:
 		token_endpoint: Optional[str],
 		passcode_token: Optional[str],
 		verify: bool | str,
+		nifi_api_base: Optional[str] = None,
+		nifi_user: Optional[str] = None,
+		nifi_password: Optional[str] = None,
+		client_cert: Optional[str] = None,
+		client_key: Optional[str] = None,
 	):
 		self.gateway_url = gateway_url.rstrip("/") if gateway_url else ""
 		self.token = token
@@ -28,21 +33,32 @@ class KnoxAuthFactory:
 		)
 		self.passcode_token = passcode_token
 		self.verify = verify
+		# Standalone / local NiFi (no Knox in front)
+		self.nifi_api_base = nifi_api_base.rstrip("/") if nifi_api_base else None
+		self.nifi_user = nifi_user
+		self.nifi_password = nifi_password
+		self.client_cert = client_cert
+		self.client_key = client_key
 
 	def build_session(self) -> requests.Session:
 		session = requests.Session()
 		session.verify = self.verify
 
-		# Priority: Explicit Cookie -> Knox token (as cookie for CDP) -> Passcode token -> Basic creds token exchange
+		# Priority: Explicit Cookie -> Knox token (as cookie for CDP) -> mTLS client cert
+		# -> Passcode token -> Knox basic creds token exchange -> local NiFi login -> anonymous
 		if self.cookie:
 			session.headers["Cookie"] = self.cookie
 			return session
-		
+
 		if self.token:
 			# For CDP NiFi, Knox JWT tokens must be sent as cookies, not Bearer headers
 			session.headers["Cookie"] = f"hadoop-jwt={self.token}"
 			return session
 
+		if self.client_cert and self.client_key:
+			# mTLS: NiFi identifies the caller from the client certificate, no bearer token needed
+			session.cert = (self.client_cert, self.client_key)
+			return session
 
 		if self.passcode_token:
 			# Prefer exchanging passcode for JWT via knoxtoken endpoint when available
@@ -59,7 +75,29 @@ class KnoxAuthFactory:
 			session.headers["Authorization"] = f"Bearer {jwt}"
 			return session
 
+		if self.nifi_user and self.nifi_password and self.nifi_api_base:
+			# Standalone NiFi (single-user or LDAP/OIDC-via-login-identity-provider):
+			# POST credentials directly to NiFi's own /access/token endpoint.
+			jwt = self._fetch_nifi_token()
+			session.headers["Authorization"] = f"Bearer {jwt}"
+			return session
+
+		# No credentials configured: anonymous session (fine for NiFi instances
+		# running with anonymous access enabled, e.g. local/dev deployments).
 		return session
+
+	def _fetch_nifi_token(self) -> str:
+		"""Login directly against a standalone NiFi's /access/token endpoint."""
+		resp = requests.post(
+			f"{self.nifi_api_base}/access/token",
+			data={"username": self.nifi_user, "password": self.nifi_password},
+			headers={"Content-Type": "application/x-www-form-urlencoded"},
+			verify=self.verify,
+			timeout=15,
+		)
+		resp.raise_for_status()
+		# NiFi returns the raw JWT as the response body (text/plain), not JSON
+		return resp.text.strip()
 
 	def _fetch_knox_token(self) -> str:
 		# Default Knox token endpoint returns raw JWT or JSON with token fields

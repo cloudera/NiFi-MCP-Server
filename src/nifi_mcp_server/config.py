@@ -16,7 +16,7 @@ class ServerConfig:
 	knox_gateway_url: str = os.getenv("KNOX_GATEWAY_URL", "")
 	nifi_api_base: Optional[str] = os.getenv("NIFI_API_BASE")
 
-	# Auth options
+	# Auth options (Knox / CDP)
 	knox_token: Optional[str] = os.getenv("KNOX_TOKEN")
 	knox_cookie: Optional[str] = os.getenv("KNOX_COOKIE")
 	knox_user: Optional[str] = os.getenv("KNOX_USER")
@@ -25,6 +25,14 @@ class ServerConfig:
 
 	# Optional passcode token (e.g., Livy/Knox) for alternate auth patterns
 	knox_passcode_token: Optional[str] = os.getenv("KNOX_PASSCODE_TOKEN")
+
+	# Auth options (standalone / local NiFi, no Knox in front)
+	# Single-user or LDAP login against NiFi's own /access/token endpoint
+	nifi_username: Optional[str] = os.getenv("NIFI_USERNAME")
+	nifi_password: Optional[str] = os.getenv("NIFI_PASSWORD")
+	# mTLS client certificate auth against NiFi directly
+	nifi_client_cert: Optional[str] = os.getenv("NIFI_CLIENT_CERT")
+	nifi_client_key: Optional[str] = os.getenv("NIFI_CLIENT_KEY")
 
 	# TLS/HTTP
 	verify_ssl_env: str = os.getenv("KNOX_VERIFY_SSL", "true").lower()

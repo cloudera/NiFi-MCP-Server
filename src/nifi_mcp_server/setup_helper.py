@@ -82,18 +82,32 @@ class SetupGuide:
         elif not nifi_api_base.startswith("http"):
             errors.append("❌ NIFI_API_BASE must start with 'http://' or 'https://'")
         
-        # Check authentication (at least one method)
+        # Check authentication (at least one method - Knox/CDP, or standalone/local NiFi)
         knox_token = os.getenv("KNOX_TOKEN")
         knox_cookie = os.getenv("KNOX_COOKIE")
         knox_user = os.getenv("KNOX_USER")
         knox_password = os.getenv("KNOX_PASSWORD")
-        
-        has_auth = any([knox_token, knox_cookie, (knox_user and knox_password)])
-        
+        knox_passcode_token = os.getenv("KNOX_PASSCODE_TOKEN")
+
+        nifi_username = os.getenv("NIFI_USERNAME")
+        nifi_password = os.getenv("NIFI_PASSWORD")
+        nifi_client_cert = os.getenv("NIFI_CLIENT_CERT")
+        nifi_client_key = os.getenv("NIFI_CLIENT_KEY")
+
+        has_knox_auth = any([knox_token, knox_cookie, (knox_user and knox_password), knox_passcode_token])
+        has_local_nifi_auth = any([(nifi_username and nifi_password), (nifi_client_cert and nifi_client_key)])
+        has_auth = has_knox_auth or has_local_nifi_auth
+
         if not has_auth:
-            warnings.append("⚠️  No authentication configured (requests will fail if auth is required)")
-            warnings.append("   Recommended: Set KNOX_TOKEN for CDP NiFi")
-            warnings.append("   Example: export KNOX_TOKEN='eyJqa3UiOi...'")
+            # Neither Knox/CDP nor standalone-NiFi credentials are set. This is expected
+            # (and fine) when NiFi is running with anonymous access enabled, e.g. a local
+            # single-user dev instance - so this is informational, not a problem to fix.
+            warnings.append("⚠️  No authentication configured - requests will be sent anonymously")
+            warnings.append("   This is fine for local/dev NiFi with anonymous access enabled.")
+            warnings.append("   Otherwise, set ONE of:")
+            warnings.append("     - KNOX_TOKEN / KNOX_COOKIE / KNOX_USER+KNOX_PASSWORD (Knox / CDP)")
+            warnings.append("     - NIFI_USERNAME+NIFI_PASSWORD (standalone NiFi login)")
+            warnings.append("     - NIFI_CLIENT_CERT+NIFI_CLIENT_KEY (standalone NiFi mTLS)")
         
         # Check SSL verification
         verify_ssl = os.getenv("KNOX_VERIFY_SSL", "true").lower()
@@ -143,6 +157,18 @@ class SetupGuide:
    export KNOX_USER="your_username"
    export KNOX_PASSWORD="your_password"
 
+   -- OR, for standalone NiFi with no Knox in front --
+
+   Option D - Standalone NiFi login (single-user or LDAP):
+   export NIFI_USERNAME="your_username"
+   export NIFI_PASSWORD="your_password"
+
+   Option E - Standalone NiFi mTLS:
+   export NIFI_CLIENT_CERT="/path/to/client-cert.pem"
+   export NIFI_CLIENT_KEY="/path/to/client-key.pem"
+
+   -- OR leave authentication unset for a NiFi instance with anonymous access enabled --
+
 3. Permissions (Optional)
    
    For read-only mode (safe exploration):
@@ -171,6 +197,28 @@ export NIFI_API_BASE="https://nifi-2-dh-management0.my-cluster.com/nifi-2-dh/cdp
 
 # 2. Set your Knox token
 export KNOX_TOKEN="eyJqa3UiOi..."
+
+# 3. Enable write operations (for building flows)
+export NIFI_READONLY="false"
+
+# 4. Verify configuration
+python -c "from nifi_mcp_server.setup_helper import SetupGuide; SetupGuide.check_and_report()"
+
+⚡ QUICK START FOR LOCAL / STANDALONE NIFI (NO KNOX)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 1. Set your NiFi URL
+export NIFI_API_BASE="https://localhost:8443/nifi-api"
+
+# 2a. Login with username/password (single-user or LDAP NiFi)
+export NIFI_USERNAME="admin"
+export NIFI_PASSWORD="your_password"
+
+#   -- OR 2b. mTLS with a client certificate --
+# export NIFI_CLIENT_CERT="/path/to/client-cert.pem"
+# export NIFI_CLIENT_KEY="/path/to/client-key.pem"
+
+#   -- OR 2c. leave both unset if NiFi has anonymous access enabled --
 
 # 3. Enable write operations (for building flows)
 export NIFI_READONLY="false"
@@ -221,9 +269,13 @@ python -c "from nifi_mcp_server.setup_helper import SetupGuide; SetupGuide.check
             elif os.getenv("KNOX_COOKIE"):
                 print(f"   Authentication: Knox Cookie (configured)")
             elif os.getenv("KNOX_USER"):
-                print(f"   Authentication: Basic Auth (user: {os.getenv('KNOX_USER')})")
+                print(f"   Authentication: Knox Basic Auth (user: {os.getenv('KNOX_USER')})")
+            elif os.getenv("NIFI_CLIENT_CERT"):
+                print(f"   Authentication: Standalone NiFi mTLS (configured)")
+            elif os.getenv("NIFI_USERNAME"):
+                print(f"   Authentication: Standalone NiFi login (user: {os.getenv('NIFI_USERNAME')})")
             else:
-                print(f"   Authentication: None")
+                print(f"   Authentication: None (anonymous)")
             print()
         elif is_valid:
             print("✅ Configuration is valid (with warnings)\n")

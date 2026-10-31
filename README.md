@@ -1,18 +1,39 @@
-# NiFi MCP Server (via Knox)
+# NiFi MCP Server
 
-Model Context Protocol server providing selectable read and write access to Apache NiFi via Apache Knox.
+Model Context Protocol server providing selectable read and write access to Apache NiFi. Works with NiFi behind Apache Knox (CDP) **and** with a standalone/local NiFi instance with no Knox in front of it.
 
 **Works with both NiFi 1.x and 2.x** - automatic version detection and adaptation.
 
 ![](/screenshots/Nifi-meet-mcp.png)
 
+## Local NiFi API simulator and safety harness
+
+The deterministic simulator in `tests/nifi_api_simulator.py` implements a deliberately small subset of the NiFi REST API for local HTTP contract tests. It is a test double only: it does not run flows, emulate the NiFi engine, or prove compatibility with a real Apache NiFi/Cloudera deployment.
+
+Run the automated suite without Docker or external services:
+
+```bash
+PYTHONPATH=src python -m pytest -q
+PYTHONPATH=src python -m compileall -q src tests scripts
+```
+
+To inspect the simulator manually, bind to loopback only:
+
+```bash
+python tests/nifi_api_simulator.py --host 127.0.0.1 --port 18787
+curl -sS http://127.0.0.1:18787/nifi-api/flow/about
+```
+
+Optional `--token` enables a simulator-only bearer token. Never use real credentials for the simulator. Do not bind it to `0.0.0.0`, expose it through a tunnel, or use its responses as production evidence. The tests exercise version/root-group/processor/connection/controller-service/bulletin reads, authentication denial, retry handling and a simulated ambiguous POST timeout. Mutation safety is tested against the simulator only; no live NiFi mutation is attempted.
+
 ## Features
 
 - **Automatic version detection** - Detects NiFi 1.x vs 2.x and adapts behavior
 - **Knox authentication** - Supports Bearer tokens, cookies, and passcode tokens for CDP deployments
+- **Standalone NiFi authentication** - Direct username/password login or mTLS client certificates for local/on-prem NiFi with no Knox in front
 - **Read-only by default** - Safe exploration of NiFi flows and configuration
 - **Intelligent flow building** - Pattern recognition and requirements gathering for complex flows
-- **24 read-only MCP tools** for exploring NiFi:
+- **35 read-only MCP tools** for exploring NiFi:
   - `get_nifi_version()` - Version and build information
   - `get_root_process_group()` - Root process group details
   - `list_processors(process_group_id)` - List processors in a process group
@@ -37,7 +58,18 @@ Model Context Protocol server providing selectable read and write access to Apac
   - `get_setup_instructions()` - Interactive setup guidance for NiFi MCP Server
   - `get_best_practices_guide()` - Best practices for building NiFi flows
   - `get_recommended_workflow(flow_type)` - Step-by-step guidance for common flow patterns
-- **42 write operations** (when `NIFI_READONLY=false`):
+  - `list_queue_flowfiles(connection_id, max_results?)` - List flowfiles waiting in a connection's queue
+  - `get_flowfile_details(connection_id, flowfile_uuid)` - Attributes/metadata for a single queued flowfile
+  - `get_flowfile_content(connection_id, flowfile_uuid, max_bytes?)` - Download a queued flowfile's content
+  - `search_provenance(component_id?, flowfile_uuid?, search_terms?, ...)` - Search provenance events (why a flowfile failed, where it came from)
+  - `get_provenance_event_details(event_id)` - Full details for a single provenance event
+  - `get_provenance_event_content(event_id, direction, max_bytes?)` - Download a flowfile content snapshot from a provenance event
+  - `get_system_diagnostics()` - JVM/host diagnostics: heap, CPU, disk usage, GC, uptime
+  - `get_processor_diagnostics(processor_id)` - Deep diagnostics for a processor (thread dumps, connections) - investigate stuck processors
+  - `get_cluster_summary()` - Whether this NiFi is clustered, and node counts
+  - `list_cluster_nodes()` - Cluster node status (returns `{"clustered": false}` for standalone NiFi)
+  - `list_counters()` - List NiFi counters (throughput tallies some processors maintain)
+- **38 write tools** (when `NIFI_READONLY=false`; optionally restricted by `NIFI_ALLOWED_ACTIONS`):
   - `start_processor(processor_id, version)` - Start a processor
   - `stop_processor(processor_id, version)` - Stop a processor
   - `create_processor(...)` - Create a new processor
@@ -74,6 +106,8 @@ Model Context Protocol server providing selectable read and write access to Apac
   - `enable_all_controller_services_in_group(pg_id)` - Bulk enable all services at once
   - `terminate_processor(processor_id, version)` - Force-terminate stuck processor (last resort)
   - `start_new_flow(flow_name, flow_description)` - Smart flow builder that automatically creates process groups and enforces best practices
+  - `replay_flowfile_from_provenance(event_id)` - Re-queue a new flowfile from a provenance event's content
+  - `reset_counter(counter_id)` - Reset a single NiFi counter's value to 0
 
 ## Quick Start
 
@@ -85,6 +119,18 @@ https://<your-nifi-host>/nifi-2-dh/cdp-proxy/nifi-app/nifi-api
 ```
 
 Get your Knox JWT token from the CDP UI and use it with the configurations below.
+
+### For standalone / local NiFi deployments (no Knox)
+
+Your NiFi API base URL will typically be:
+```
+https://<nifi-host>:8443/nifi-api
+```
+
+Point `NIFI_API_BASE` directly at your NiFi instance and skip Knox entirely. Choose one of:
+- **Username/password** - set `NIFI_USERNAME` and `NIFI_PASSWORD` (works for NiFi's single-user provider or an LDAP/other login identity provider); the server logs in against NiFi's own `POST /access/token` endpoint.
+- **mTLS client certificate** - set `NIFI_CLIENT_CERT` and `NIFI_CLIENT_KEY`; NiFi identifies you from the certificate, no login call needed.
+- **Anonymous** - leave all auth variables unset if your NiFi instance has anonymous access enabled (e.g. a quick local/dev instance).
 
 ## Setup
 
@@ -122,6 +168,53 @@ Get your Knox JWT token from the CDP UI and use it with the configurations below
 
 3. **Restart Claude Desktop** and start asking questions about your NiFi flows!
 
+**Example: standalone/local NiFi (no Knox), username/password login:**
+```json
+{
+  "mcpServers": {
+    "nifi-mcp-server": {
+      "command": "/FULL/PATH/TO/NiFi-MCP-Server/.venv/bin/python",
+      "args": [
+        "-m",
+        "nifi_mcp_server.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "NIFI_API_BASE": "https://localhost:8443/nifi-api",
+        "NIFI_USERNAME": "admin",
+        "NIFI_PASSWORD": "<your_nifi_password>",
+        "KNOX_VERIFY_SSL": "false",
+        "NIFI_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+**Example: standalone/local NiFi (no Knox), mTLS client certificate:**
+```json
+{
+  "mcpServers": {
+    "nifi-mcp-server": {
+      "command": "/FULL/PATH/TO/NiFi-MCP-Server/.venv/bin/python",
+      "args": [
+        "-m",
+        "nifi_mcp_server.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "NIFI_API_BASE": "https://localhost:8443/nifi-api",
+        "NIFI_CLIENT_CERT": "/FULL/PATH/TO/client-cert.pem",
+        "NIFI_CLIENT_KEY": "/FULL/PATH/TO/client-key.pem",
+        "NIFI_READONLY": "true"
+      }
+    }
+  }
+}
+```
+
+> `KNOX_VERIFY_SSL=false` above is only needed for a local NiFi using a self-signed certificate; use `KNOX_CA_BUNDLE` to point at a CA bundle instead when possible.
+
 ### Option 2: Direct Installation (Cloudera Agent Studio)
 
 For use with Cloudera Agent Studio, use the `uvx` command:
@@ -153,11 +246,31 @@ All configuration is done via environment variables:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `NIFI_API_BASE` | Yes* | Full NiFi API URL (e.g., `https://host/nifi-2-dh/cdp-proxy/nifi-app/nifi-api`) |
-| `KNOX_TOKEN` | Yes* | Knox JWT token for authentication |
+| `NIFI_API_BASE` | Yes* | Full NiFi API URL (e.g., `https://host/nifi-2-dh/cdp-proxy/nifi-app/nifi-api`, or `https://host:8443/nifi-api` for standalone NiFi) |
 | `KNOX_GATEWAY_URL` | No | Knox gateway URL (alternative to `NIFI_API_BASE`) |
-| `KNOX_COOKIE` | No | Alternative: provide full cookie string instead of token |
-| `KNOX_PASSCODE_TOKEN` | No | Alternative: Knox passcode token (auto-exchanged for JWT) |
+
+**Knox / CDP authentication** (any one of these; recommended when NiFi sits behind Knox):
+
+| Variable | Description |
+|----------|-------------|
+| `KNOX_TOKEN` | Knox JWT token for authentication |
+| `KNOX_COOKIE` | Alternative: provide full cookie string instead of token |
+| `KNOX_USER` / `KNOX_PASSWORD` | Alternative: Knox basic-auth credentials, exchanged for a JWT |
+| `KNOX_PASSCODE_TOKEN` | Alternative: Knox passcode token (auto-exchanged for JWT) |
+
+**Standalone / local NiFi authentication** (no Knox in front; any one of these):
+
+| Variable | Description |
+|----------|-------------|
+| `NIFI_USERNAME` / `NIFI_PASSWORD` | Logs in directly against NiFi's own `/access/token` endpoint (single-user or LDAP/other login identity provider) |
+| `NIFI_CLIENT_CERT` / `NIFI_CLIENT_KEY` | Paths to a client certificate/key for mTLS auth directly against NiFi |
+
+If none of the above are set, the server connects anonymously - fine for a local/dev NiFi with anonymous access enabled, otherwise NiFi will reject the requests.
+
+**Other options:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
 | `NIFI_READONLY` | No | Read-only mode (default: `true`) |
 | `KNOX_VERIFY_SSL` | No | Verify SSL certificates (default: `true`) |
 | `KNOX_CA_BUNDLE` | No | Path to CA certificate bundle |
@@ -235,3 +348,43 @@ To enable write operations, set `NIFI_READONLY=false` in your configuration. The
 ## License
 
 Apache License 2.0
+
+
+## Modernisation decision record
+
+The rationale for preserving the original local `stdio` deployment model during the first modernisation pass, the assumptions we are testing, and the alternatives to evaluate after the baseline is approved are documented in [`MODERNISATION-DECISION-RECORD.md`](MODERNISATION-DECISION-RECORD.md). This records hypotheses as hypotheses; it does not claim to know the original author's private reasoning or imply that live NiFi integration has already been verified.
+
+
+## Local MCP protocol smoke tests
+
+These tests verify MCP initialization and tool registration only. The stdio smoke test forcibly uses an unreachable placeholder NiFi URL, forces read-only mode, and strips inherited NiFi/Knox credentials so it cannot accidentally use a live target. It does **not** verify that a configured NiFi API is reachable or authenticated.
+
+With the test environment installed:
+
+```bash
+PYTHONPATH=src python scripts/smoke_mcp.py
+```
+
+To test Streamable HTTP, start the server in a second terminal with `MCP_TRANSPORT=streamable-http`, then run:
+
+```bash
+PYTHONPATH=src python scripts/smoke_mcp.py --transport streamable-http --url http://127.0.0.1:8000/mcp
+```
+
+Keep the HTTP listener on loopback for this smoke test. Do not expose it to a network without implementing and verifying authentication, authorisation, TLS and a secure network path to NiFi. Use an authorised real NiFi endpoint and keep `NIFI_READONLY=true` for end-to-end read acceptance.
+
+
+The allowlist is a tool-exposure guardrail, not a substitute for NiFi's own authentication and authorisation policies.
+
+
+---
+
+## Project status — demonstration only (2026-10-31)
+
+**This repository is retained as a bounded demonstration/reference implementation. Apache NiFi is not a dependency of the operational system.** No live NiFi/Cloudera integration, remote deployment or production service is required or claimed.
+
+Start with the [Demonstration Guide](DEMO-GUIDE.md) for the purpose, architecture, local run instructions, test evidence, safety boundaries and cleanup steps. The deterministic simulator is a test double only; all fixture data is simulated.
+
+The final local verification receipt is in [MODERNISATION-RECEIPT.md](MODERNISATION-RECEIPT.md). The [decision record](MODERNISATION-DECISION-RECORD.md) contains the superseding demonstration-only decision. Earlier live-integration and hosting plans in historical sections are superseded and are not active instructions.
+
+Retain this code and its test artefacts. Do not provision Cloudera, deploy a public/remote NiFi endpoint, or make NiFi a production dependency for this project.

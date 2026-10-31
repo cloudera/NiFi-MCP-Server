@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import base64
+import time
+import re
 from typing import Any, Dict, Optional, Tuple, List
-from functools import lru_cache
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+
+def _is_retryable_read_error(exc: BaseException) -> bool:
+	"""Retry transient read failures, but not ordinary client/configuration errors."""
+	if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+		return True
+	if isinstance(exc, NiFiError):
+		return exc.status_code == 429 or (exc.status_code is not None and exc.status_code >= 500)
+	return False
 
 
 class NiFiError(Exception):
@@ -39,7 +50,7 @@ class NiFiClient:
 		return f"{self.base_url}/{path.lstrip('/')}"
 
 	@retry(
-		retry=retry_if_exception_type((NiFiError, requests.HTTPError, requests.ConnectionError, requests.Timeout)),
+		retry=retry_if_exception(_is_retryable_read_error),
 		wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
 		stop=stop_after_attempt(3),
 		reraise=True,
@@ -56,12 +67,6 @@ class NiFiClient:
 			)
 		return resp.json()
 
-	@retry(
-		retry=retry_if_exception_type((NiFiError, requests.HTTPError, requests.ConnectionError, requests.Timeout)),
-		wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-		stop=stop_after_attempt(3),
-		reraise=True,
-	)
 	def _put(self, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
 		resp = self.session.put(self._url(path), json=data, timeout=self.timeout)
 		if not resp.ok:
@@ -74,12 +79,6 @@ class NiFiClient:
 			)
 		return resp.json()
 
-	@retry(
-		retry=retry_if_exception_type((NiFiError, requests.HTTPError, requests.ConnectionError, requests.Timeout)),
-		wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-		stop=stop_after_attempt(3),
-		reraise=True,
-	)
 	def _post(self, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
 		resp = self.session.post(self._url(path), json=data, timeout=self.timeout)
 		if not resp.ok:
@@ -92,12 +91,6 @@ class NiFiClient:
 			)
 		return resp.json()
 
-	@retry(
-		retry=retry_if_exception_type((NiFiError, requests.HTTPError, requests.ConnectionError, requests.Timeout)),
-		wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
-		stop=stop_after_attempt(3),
-		reraise=True,
-	)
 	def _delete(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 		resp = self.session.delete(self._url(path), params=params, timeout=self.timeout)
 		if not resp.ok:
@@ -110,22 +103,41 @@ class NiFiClient:
 			)
 		return resp.json() if resp.content else {}
 
+	@retry(
+		retry=retry_if_exception(_is_retryable_read_error),
+		wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+		stop=stop_after_attempt(3),
+		reraise=True,
+	)
+	def _get_raw(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+		"""GET that returns the raw response instead of parsing JSON (e.g. binary flowfile content)."""
+		resp = self.session.get(self._url(path), params=params, timeout=self.timeout)
+		if not resp.ok:
+			error_body = resp.text if resp.text else "(empty response)"
+			raise NiFiError(
+				f"GET {path} failed: {resp.reason}",
+				status_code=resp.status_code,
+				response_body=error_body
+			)
+		return resp
+
 	def get_version_info(self) -> Dict[str, Any]:
 		"""Get NiFi version and build information."""
 		return self._get("flow/about")
 
 	def get_version_tuple(self) -> Tuple[int, int, int]:
-		"""Get NiFi version as (major, minor, patch) tuple for version detection."""
+		"""Return the detected NiFi version; never guess after a failed lookup."""
 		if self._version_info is None:
-			try:
-				about = self.get_version_info()
-				version_str = about.get("about", {}).get("version", "1.0.0")
-				# Parse version string like "2.0.0" or "1.23.2"
-				parts = version_str.split(".")[:3]
-				self._version_info = tuple(int(p) for p in parts)
-			except Exception:
-				# Default to 1.x if detection fails
-				self._version_info = (1, 0, 0)
+			about = self.get_version_info()
+			version_str = about.get("about", {}).get("version")
+			match = re.match(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?", str(version_str or ""))
+			if not match:
+				raise NiFiError(
+					"Unable to determine NiFi version from /flow/about; "
+					"version-sensitive operations are blocked until detection succeeds."
+				)
+			major, minor, patch = match.groups()
+			self._version_info = (int(major), int(minor), int(patch or 0))
 		return self._version_info
 
 	def is_nifi_2x(self) -> bool:
@@ -742,11 +754,13 @@ class NiFiClient:
 			"connections": {"total": 0, "with_queued_data": 0, "backpressure": 0},
 			"bulletins": [],
 			"errors": [],
-			"overallHealth": "HEALTHY"
+			"checks": {"processors": "PENDING", "connections": "PENDING", "controllerServices": "PENDING", "bulletins": "PENDING"},
+			"overallHealth": "UNKNOWN"
 		}
 		
 		# Get processors
 		processors = self.list_processors(pg_id)
+		health["checks"]["processors"] = "OK"
 		for proc in processors.get("processors", []):
 			health["processors"]["total"] += 1
 			run_status = proc.get("status", {}).get("runStatus", "STOPPED")
@@ -775,11 +789,14 @@ class NiFiClient:
 				elif "INVALID" in state or "ERROR" in state:
 					health["controllerServices"]["invalid"] += 1
 					health["errors"].append(f"Service '{svc.get('component', {}).get('name')}' is invalid")
-		except Exception:
-			pass  # Services might not be accessible at all levels
+			health["checks"]["controllerServices"] = "OK"
+		except Exception as exc:
+			health["checks"]["controllerServices"] = "FAILED"
+			health["errors"].append(f"Controller-service check failed: {type(exc).__name__}: {exc}")
 		
 		# Get connections
 		connections = self.list_connections(pg_id)
+		health["checks"]["connections"] = "OK"
 		for conn in connections.get("connections", []):
 			health["connections"]["total"] += 1
 			status = conn.get("status", {})
@@ -805,12 +822,16 @@ class NiFiClient:
 				})
 				if bulletin.get("bulletin", {}).get("level") in ["ERROR", "WARN"]:
 					health["errors"].append(bulletin.get("bulletin", {}).get("message"))
-		except Exception:
-			pass
-		
-		# Determine overall health
+			health["checks"]["bulletins"] = "OK"
+		except Exception as exc:
+			health["checks"]["bulletins"] = "FAILED"
+			health["errors"].append(f"Bulletin check failed: {type(exc).__name__}: {exc}")
+
+		# Missing coverage must never be presented as a clean bill of health.
 		if health["processors"]["invalid"] > 0 or health["controllerServices"]["invalid"] > 0:
 			health["overallHealth"] = "UNHEALTHY"
+		elif any(status == "FAILED" for status in health["checks"].values()):
+			health["overallHealth"] = "UNKNOWN"
 		elif health["connections"]["backpressure"] > 0 or len(health["errors"]) > 0:
 			health["overallHealth"] = "DEGRADED"
 		else:
@@ -836,5 +857,202 @@ class NiFiClient:
 			f"processors/{processor_id}/threads",
 			params={"version": version}
 		)
+
+	# ===== FlowFile Queue & Provenance (Debug Tools) =====
+
+	@staticmethod
+	def _content_response(resp: requests.Response, max_bytes: int) -> Dict[str, Any]:
+		"""Shape a raw content response (flowfile or provenance event content) for LLM consumption."""
+		raw = resp.content
+		total_bytes = len(raw)
+		preview = raw[:max_bytes]
+		try:
+			text = preview.decode("utf-8")
+			encoding = "utf-8"
+		except UnicodeDecodeError:
+			text = base64.b64encode(preview).decode("ascii")
+			encoding = "base64"
+		return {
+			"contentType": resp.headers.get("Content-Type", "application/octet-stream"),
+			"totalBytes": total_bytes,
+			"returnedBytes": len(preview),
+			"truncated": total_bytes > max_bytes,
+			"encoding": encoding,
+			"content": text,
+		}
+
+	def list_queue_flowfiles(self, connection_id: str, max_results: int = 100, max_polls: int = 20, poll_interval: float = 0.5) -> Dict[str, Any]:
+		"""List flowfiles currently sitting in a connection's queue (read-only).
+
+		Submits a NiFi "listing request", polls until it finishes, then cleans it up.
+		NiFi itself caps a single listing at 100 flowfiles; max_results only truncates further.
+		Use get_flowfile_details()/get_flowfile_content() with the returned uuids to dig deeper.
+		"""
+		resp = self._post(f"flowfile-queues/{connection_id}/listing-requests", {})
+		listing_request = resp.get("listingRequest", {})
+		request_id = listing_request.get("id")
+		try:
+			for _ in range(max_polls):
+				if listing_request.get("finished"):
+					break
+				time.sleep(poll_interval)
+				resp = self._get(f"flowfile-queues/{connection_id}/listing-requests/{request_id}")
+				listing_request = resp.get("listingRequest", {})
+		finally:
+			if request_id:
+				try:
+					self._delete(f"flowfile-queues/{connection_id}/listing-requests/{request_id}")
+				except Exception:
+					pass  # Best-effort cleanup; the request also expires on its own
+
+		summaries = listing_request.get("flowFileSummaries") or []
+		return {
+			"finished": listing_request.get("finished", False),
+			"queueSize": listing_request.get("queueSize", {}),
+			"flowfiles": summaries[:max_results],
+		}
+
+	def get_flowfile_details(self, connection_id: str, flowfile_uuid: str) -> Dict[str, Any]:
+		"""Get metadata and attributes for a single queued flowfile (read-only)."""
+		return self._get(f"flowfile-queues/{connection_id}/flowfiles/{flowfile_uuid}")
+
+	def get_flowfile_content(self, connection_id: str, flowfile_uuid: str, max_bytes: int = 8192) -> Dict[str, Any]:
+		"""Download the content of a single queued flowfile (read-only).
+
+		Content is truncated to max_bytes and returned as UTF-8 text when possible,
+		otherwise base64-encoded (see the "encoding" field of the result).
+		"""
+		resp = self._get_raw(f"flowfile-queues/{connection_id}/flowfiles/{flowfile_uuid}/content")
+		return self._content_response(resp, max_bytes)
+
+	def search_provenance(
+		self,
+		search_terms: Optional[Dict[str, str]] = None,
+		component_id: Optional[str] = None,
+		flowfile_uuid: Optional[str] = None,
+		start_date: Optional[str] = None,
+		end_date: Optional[str] = None,
+		max_results: int = 100,
+		max_polls: int = 20,
+		poll_interval: float = 0.5,
+	) -> Dict[str, Any]:
+		"""Search provenance events (read-only) - answers "where did this flowfile come from /
+		why did it fail / what happened to it".
+
+		search_terms: raw field->value map matching NiFi's provenance search fields
+		  (e.g. {"Filename": "orders.csv", "EventType": "DROP"}).
+		component_id: convenience filter for events produced by a specific processor
+		  (adds a "ProcessorID" search term).
+		flowfile_uuid: convenience filter for a specific flowfile's full lineage
+		  (adds a "FlowFileUUID" search term).
+		start_date/end_date: NiFi provenance date format, e.g. "09/11/2026 00:00:00 UTC".
+		"""
+		terms: Dict[str, Dict[str, str]] = {}
+		for key, value in (search_terms or {}).items():
+			terms[key] = {"value": value}
+		if component_id:
+			terms["ProcessorID"] = {"value": component_id}
+		if flowfile_uuid:
+			terms["FlowFileUUID"] = {"value": flowfile_uuid}
+
+		request: Dict[str, Any] = {"maxResults": max_results}
+		if terms:
+			request["searchTerms"] = terms
+		if start_date:
+			request["startDate"] = start_date
+		if end_date:
+			request["endDate"] = end_date
+
+		resp = self._post("provenance", {"provenance": {"request": request}})
+		provenance = resp.get("provenance", {})
+		query_id = provenance.get("id")
+		try:
+			for _ in range(max_polls):
+				if provenance.get("finished"):
+					break
+				time.sleep(poll_interval)
+				resp = self._get(f"provenance/{query_id}")
+				provenance = resp.get("provenance", {})
+		finally:
+			if query_id:
+				try:
+					self._delete(f"provenance/{query_id}")
+				except Exception:
+					pass  # Best-effort cleanup; the query also expires on its own
+
+		results = provenance.get("results", {}) or {}
+		return {
+			"finished": provenance.get("finished", False),
+			"total": results.get("total"),
+			"events": results.get("provenanceEvents", []),
+		}
+
+	def get_provenance_event(self, event_id: str) -> Dict[str, Any]:
+		"""Get full details for a single provenance event (read-only), including whether its
+		flowfile content is still available to download and whether it can be replayed.
+		"""
+		return self._get(f"provenance-events/{event_id}")
+
+	def get_provenance_event_content(self, event_id: str, direction: str = "output", max_bytes: int = 8192) -> Dict[str, Any]:
+		"""Download the flowfile content snapshot associated with a provenance event (read-only).
+
+		direction: "input" or "output" - use get_provenance_event() first and check
+		inputContentAvailable/outputContentAvailable to see which are available for this event.
+		"""
+		direction = direction.lower()
+		if direction not in ("input", "output"):
+			raise ValueError("direction must be 'input' or 'output'")
+		resp = self._get_raw(f"provenance-events/{event_id}/content/{direction}")
+		return self._content_response(resp, max_bytes)
+
+	def replay_flowfile_from_provenance(self, event_id: str) -> Dict[str, Any]:
+		"""Re-queue a new flowfile from a provenance event's content. Requires NIFI_READONLY=false.
+
+		Only works when the event's source connection still exists - check
+		get_provenance_event(event_id)["provenanceEvent"]["replayAvailable"] first.
+		"""
+		return self._post(f"provenance-events/{event_id}/replays", {})
+
+	# ===== Operational Diagnostics =====
+
+	def get_system_diagnostics(self) -> Dict[str, Any]:
+		"""Get JVM/host diagnostics for the NiFi instance (read-only): heap/CPU usage,
+		garbage collection, disk usage for the flowfile/content/provenance repositories, uptime.
+		"""
+		return self._get("system-diagnostics")
+
+	def get_processor_diagnostics(self, processor_id: str) -> Dict[str, Any]:
+		"""Get deep diagnostics for a single processor (read-only): thread dumps for any
+		active threads, referenced controller services, and incoming/outgoing connection
+		status. Use this to investigate a processor that appears stuck.
+		"""
+		return self._get(f"processors/{processor_id}/diagnostics")
+
+	def get_cluster_summary(self) -> Dict[str, Any]:
+		"""Get cluster status (read-only): whether this NiFi is clustered, and connected/total node counts."""
+		return self._get("flow/cluster/summary")
+
+	def list_cluster_nodes(self) -> Dict[str, Any]:
+		"""List cluster nodes and their status (read-only).
+
+		Returns {"clustered": False} for a standalone (non-clustered) NiFi instance instead
+		of raising, since /controller/cluster only works when NiFi is part of a cluster.
+		"""
+		try:
+			return {"clustered": True, **self._get("controller/cluster")}
+		except NiFiError as e:
+			if e.status_code in (404, 409):
+				return {"clustered": False, "nodes": []}
+			raise
+
+	def list_counters(self) -> Dict[str, Any]:
+		"""List all NiFi counters (read-only). Counters are lightweight named tallies some
+		processors increment (e.g. records read/written) - useful for monitoring throughput.
+		"""
+		return self._get("counters")
+
+	def reset_counter(self, counter_id: str) -> Dict[str, Any]:
+		"""Reset a single counter's value to 0. Requires NIFI_READONLY=false."""
+		return self._put(f"counters/{counter_id}", {})
 
 
